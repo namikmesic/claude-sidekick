@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/namikmesic/claude-sidekick/internal/config"
+	"github.com/namikmesic/claude-sidekick/internal/jetstream"
 	"github.com/namikmesic/claude-sidekick/internal/processor"
 	"github.com/namikmesic/claude-sidekick/internal/proxy"
 	"github.com/namikmesic/claude-sidekick/internal/storage"
@@ -42,9 +43,33 @@ func main() {
 		log.Fatal().Err(err).Msg("failed to run migrations")
 	}
 
+	natsServer, err := jetstream.NewServer(cfg.NATSStoreDir)
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to start embedded NATS")
+	}
+
+	nc, err := natsServer.Connect()
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to connect to embedded NATS")
+	}
+	defer nc.Drain()
+
+	js, err := nc.JetStream()
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to get JetStream context")
+	}
+	if err := jetstream.EnsureStream(js); err != nil {
+		log.Fatal().Err(err).Msg("failed to create JetStream stream")
+	}
+
 	writer := storage.NewBatchWriter(pool, cfg.WriterBufferSize, cfg.WriterBatchSize, cfg.WriterFlushMs)
 	proc := processor.New(writer)
-	handler := proxy.NewHandler(cfg, writer, proc)
+
+	consumerCtx, consumerCancel := context.WithCancel(ctx)
+	defer consumerCancel()
+	go proc.StartConsumer(consumerCtx, js)
+
+	handler := proxy.NewHandler(cfg, writer, proc, js)
 
 	addr := fmt.Sprintf(":%d", cfg.Port)
 	server := &http.Server{
@@ -72,6 +97,9 @@ func main() {
 	defer cancel()
 
 	server.Shutdown(shutdownCtx)
+	consumerCancel()
+	nc.Drain()
+	natsServer.Shutdown()
 	writer.Shutdown()
 	log.Info().Msg("shutdown complete")
 }

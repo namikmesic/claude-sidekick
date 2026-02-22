@@ -29,16 +29,15 @@ func NewPool(ctx context.Context, databaseURL string) (*pgxpool.Pool, error) {
 }
 
 func RunMigrations(ctx context.Context, pool *pgxpool.Pool) error {
-	sql, err := migrations.FS.ReadFile("001_initial.up.sql")
-	if err != nil {
-		return fmt.Errorf("read migration: %w", err)
+	for _, name := range []string{"001_initial.up.sql", "002_structured_payloads.up.sql"} {
+		sql, err := migrations.FS.ReadFile(name)
+		if err != nil {
+			return fmt.Errorf("read migration %s: %w", name, err)
+		}
+		if _, err = pool.Exec(ctx, string(sql)); err != nil {
+			return fmt.Errorf("run migration %s: %w", name, err)
+		}
 	}
-
-	_, err = pool.Exec(ctx, string(sql))
-	if err != nil {
-		return fmt.Errorf("run migration: %w", err)
-	}
-
 	log.Info().Msg("database migrations applied")
 	return nil
 }

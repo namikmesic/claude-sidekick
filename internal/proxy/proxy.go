@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
@@ -9,9 +10,10 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/namikmesic/claude-sidekick/internal/config"
+	"github.com/namikmesic/claude-sidekick/internal/jetstream"
 	"github.com/namikmesic/claude-sidekick/internal/processor"
 	"github.com/namikmesic/claude-sidekick/internal/storage"
-	"github.com/namikmesic/claude-sidekick/internal/stream"
+	nats "github.com/nats-io/nats.go"
 	"github.com/rs/zerolog/log"
 )
 
@@ -21,9 +23,10 @@ type Handler struct {
 	client    *http.Client
 	writer    *storage.BatchWriter
 	processor *processor.Processor
+	js        nats.JetStreamContext
 }
 
-func NewHandler(cfg *config.Config, writer *storage.BatchWriter, proc *processor.Processor) *Handler {
+func NewHandler(cfg *config.Config, writer *storage.BatchWriter, proc *processor.Processor, js nats.JetStreamContext) *Handler {
 	return &Handler{
 		cfg: cfg,
 		client: &http.Client{
@@ -36,6 +39,7 @@ func NewHandler(cfg *config.Config, writer *storage.BatchWriter, proc *processor
 		},
 		writer:    writer,
 		processor: proc,
+		js:        js,
 	}
 }
 
@@ -55,6 +59,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+
+	reqParsed := processor.ParseRequest(reqBody)
 
 	targetURL := buildTargetURL(h.cfg.AnthropicBaseURL, r.URL.Path, r.URL.RawQuery)
 	upstreamReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, bytes.NewReader(reqBody))
@@ -88,14 +94,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	isStreaming := isStreamingResponse(resp)
 
 	h.writer.Enqueue(storage.InsertRequestJob(&storage.RequestRecord{
-		ID:             requestID,
-		Timestamp:      ts,
-		Method:         r.Method,
-		Path:           r.URL.Path,
-		StatusCode:     resp.StatusCode,
-		Success:        resp.StatusCode >= 200 && resp.StatusCode < 400,
-		ResponseTimeMs: int(time.Since(start).Milliseconds()),
-		IsStream:       isStreaming,
+		ID:                   requestID,
+		Timestamp:            ts,
+		Method:               r.Method,
+		Path:                 r.URL.Path,
+		StatusCode:           resp.StatusCode,
+		Success:              resp.StatusCode >= 200 && resp.StatusCode < 400,
+		ResponseTimeMs:       int(time.Since(start).Milliseconds()),
+		IsStream:             isStreaming,
+		ToolCount:            reqParsed.ToolCount,
+		ThinkingBudgetTokens: reqParsed.ThinkingBudgetTokens,
 	}))
 
 	clientHeaders := prepareClientHeaders(resp.Header)
@@ -106,9 +114,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if isStreaming {
-		h.handleStreaming(w, resp, requestID, ts, r, reqBody)
+		h.handleStreaming(w, resp, requestID, ts, r, reqBody, reqParsed)
 	} else {
-		h.handleNonStreaming(w, resp, requestID, ts, r, reqBody)
+		h.handleNonStreaming(w, resp, requestID, ts, r, reqBody, reqParsed)
 	}
 
 	log.Info().
@@ -121,18 +129,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Msg("proxied request")
 }
 
-func (h *Handler) handleStreaming(w http.ResponseWriter, resp *http.Response, requestID uuid.UUID, ts time.Time, origReq *http.Request, reqBody []byte) {
-	clientReader, analyticsReader := stream.TeeBody(resp.Body)
-	go h.processor.ProcessStream(requestID, ts, analyticsReader)
-	h.storePayload(requestID, ts, origReq, reqBody, resp, nil)
+func (h *Handler) handleStreaming(w http.ResponseWriter, resp *http.Response, requestID uuid.UUID, ts time.Time, origReq *http.Request, reqBody []byte, reqParsed processor.ParsedRequest) {
+	h.storePayload(requestID, ts, origReq, reqBody, resp, nil, reqParsed, nil)
 
 	w.WriteHeader(resp.StatusCode)
 	flusher, canFlush := w.(http.Flusher)
-
 	buf := make([]byte, 32*1024)
+	subject := jetstream.ChunkSubject(requestID.String())
+
 	for {
-		n, err := clientReader.Read(buf)
+		n, err := resp.Body.Read(buf)
 		if n > 0 {
+			h.js.Publish(subject, buf[:n])
 			w.Write(buf[:n])
 			if canFlush {
 				flusher.Flush()
@@ -142,10 +150,12 @@ func (h *Handler) handleStreaming(w http.ResponseWriter, resp *http.Response, re
 			break
 		}
 	}
-	clientReader.Close()
+
+	done, _ := json.Marshal(map[string]int64{"ts": ts.UnixNano()})
+	h.js.Publish(jetstream.DoneSubject(requestID.String()), done)
 }
 
-func (h *Handler) handleNonStreaming(w http.ResponseWriter, resp *http.Response, requestID uuid.UUID, ts time.Time, origReq *http.Request, reqBody []byte) {
+func (h *Handler) handleNonStreaming(w http.ResponseWriter, resp *http.Response, requestID uuid.UUID, ts time.Time, origReq *http.Request, reqBody []byte, reqParsed processor.ParsedRequest) {
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		log.Error().Err(err).Msg("failed to read response body")
@@ -156,14 +166,28 @@ func (h *Handler) handleNonStreaming(w http.ResponseWriter, resp *http.Response,
 	w.WriteHeader(resp.StatusCode)
 	w.Write(respBody)
 
+	var stopSequence *string
+	var respParsed processor.AnthropicResponse
+	if jsonErr := json.Unmarshal(respBody, &respParsed); jsonErr == nil {
+		stopSequence = respParsed.StopSequence
+	}
+
 	go h.processor.ProcessNonStream(requestID, ts, respBody)
-	h.storePayload(requestID, ts, origReq, reqBody, resp, respBody)
+	h.storePayload(requestID, ts, origReq, reqBody, resp, respBody, reqParsed, stopSequence)
 }
 
-func (h *Handler) storePayload(requestID uuid.UUID, ts time.Time, req *http.Request, reqBody []byte, resp *http.Response, respBody []byte) {
+func (h *Handler) storePayload(requestID uuid.UUID, ts time.Time, req *http.Request, reqBody []byte, resp *http.Response, respBody []byte, reqParsed processor.ParsedRequest, stopSequence *string) {
 	reqHeaders := headerMap(req.Header)
 	respHeaders := headerMap(resp.Header)
-	h.writer.Enqueue(storage.InsertPayloadJob(requestID, ts, reqHeaders, respHeaders, reqBody, respBody))
+	extras := storage.PayloadExtras{
+		SystemPrompt: reqParsed.SystemPrompt,
+		MaxTokens:    reqParsed.MaxTokens,
+		Temperature:  reqParsed.Temperature,
+		TopP:         reqParsed.TopP,
+		MessageCount: reqParsed.MessageCount,
+		StopSequence: stopSequence,
+	}
+	h.writer.Enqueue(storage.InsertPayloadJob(requestID, ts, reqHeaders, respHeaders, reqBody, respBody, extras))
 }
 
 func isStreamingResponse(resp *http.Response) bool {

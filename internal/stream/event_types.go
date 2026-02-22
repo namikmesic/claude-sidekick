@@ -23,9 +23,34 @@ type MessageStart struct {
 	} `json:"message"`
 }
 
-// Anthropic SSE message_delta payload (final output token count).
+type ContentBlockStart struct {
+	Type  string `json:"type"`
+	Index int    `json:"index"`
+	ContentBlock struct {
+		Type string `json:"type"` // "text" | "tool_use" | "thinking"
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	} `json:"content_block"`
+}
+
+type ContentBlockDelta struct {
+	Type  string `json:"type"`
+	Index int    `json:"index"`
+	Delta struct {
+		Type        string `json:"type"` // "text_delta" | "input_json_delta" | "thinking_delta"
+		Text        string `json:"text"`
+		PartialJSON string `json:"partial_json"`
+		Thinking    string `json:"thinking"`
+	} `json:"delta"`
+}
+
+// Anthropic SSE message_delta payload (final output token count and stop reason).
 type MessageDelta struct {
 	Type  string `json:"type"`
+	Delta struct {
+		StopReason   string  `json:"stop_reason"`
+		StopSequence *string `json:"stop_sequence"`
+	} `json:"delta"`
 	Usage struct {
 		OutputTokens int `json:"output_tokens"`
 	} `json:"usage"`
