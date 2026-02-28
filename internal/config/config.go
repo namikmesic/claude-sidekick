@@ -13,6 +13,7 @@ type Config struct {
 	WriterBufferSize int    `env:"WRITER_BUFFER_SIZE" envDefault:"10000"`
 	WriterBatchSize  int    `env:"WRITER_BATCH_SIZE" envDefault:"100"`
 	WriterFlushMs    int    `env:"WRITER_FLUSH_MS" envDefault:"100"`
+	NATSStoreDir     string `env:"NATS_STORE_DIR" envDefault:"./data/nats"`
 }
 
 func Load() (*Config, error) {
